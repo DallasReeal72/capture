@@ -45,44 +45,69 @@ def capture(mvalue: str) -> bytes:
         "appName": "[DEFAULT]",
     }
 
-    # Este script se ejecuta ANTES de que cualquier JS de la página corra
-    init_script = f"""
-        // Inyectar sesión Firebase antes de que React monte
+    # Mismo script que funciona en el browser — inyectar sesión + PWA spoof
+    inject_and_navigate = f"""
+    async () => {{
         const AUTH_KEY  = {json.dumps(auth_key)};
         const authUser  = {json.dumps(auth_user)};
         const DEVICE_ID = {json.dumps(DEVICE_ID)};
+        const TARGET    = "/comprobante/{mvalue}";
 
-        // localStorage
-        try {{
-            localStorage.setItem(AUTH_KEY, JSON.stringify(authUser));
-            localStorage.setItem("device_id", DEVICE_ID);
-            localStorage.setItem("accountType", "deposit");
-        }} catch(e) {{}}
+        // 1. Sesión en localStorage
+        localStorage.setItem(AUTH_KEY, JSON.stringify(authUser));
+        localStorage.setItem("device_id", DEVICE_ID);
+        localStorage.setItem("accountType", "deposit");
+        localStorage.setItem("security_notice_dont_show_again", "true");
 
-        // PWA spoof — antes de que React lea matchMedia
-        const _origMM = window.matchMedia ? window.matchMedia.bind(window) : () => ({{}});
+        // 2. IndexedDB
+        await new Promise((resolve) => {{
+            const req = indexedDB.open("firebaseLocalStorageDb", 1);
+            req.onupgradeneeded = e => {{
+                if (!e.target.result.objectStoreNames.contains("firebaseLocalStorage"))
+                    e.target.result.createObjectStore("firebaseLocalStorage", {{ keyPath: "fbase_key" }});
+            }};
+            req.onsuccess = e => {{
+                const db = e.target.result;
+                if (!db.objectStoreNames.contains("firebaseLocalStorage")) return resolve();
+                const tx = db.transaction("firebaseLocalStorage", "readwrite");
+                tx.objectStore("firebaseLocalStorage").put({{ fbase_key: AUTH_KEY, value: authUser }});
+                tx.oncomplete = resolve; tx.onerror = resolve;
+            }};
+            req.onerror = resolve;
+        }});
+
+        // 3. PWA spoof
+        const _orig = window.matchMedia.bind(window);
         window.matchMedia = (q) => {{
             if (q && q.includes("display-mode")) return {{
                 matches: q.includes("standalone"), media: q, onchange: null,
                 addEventListener: () => {{}}, removeEventListener: () => {{}}, dispatchEvent: () => false,
             }};
-            return _origMM(q);
+            return _orig(q);
         }};
-
         try {{ Object.defineProperty(navigator, "standalone", {{ get: () => true, configurable: true }}); }} catch(e) {{}}
-
-        Object.defineProperty(navigator, "serviceWorker", {{
-            get: () => ({{
-                controller: {{ state: "activated" }},
-                ready: Promise.resolve({{ active: {{ state: "activated" }} }}),
-                addEventListener: () => {{}},
-                register: () => Promise.resolve({{}}),
-            }}),
-            configurable: true,
-        }});
+        try {{ Object.defineProperty(navigator.serviceWorker, "controller", {{ get: () => ({{ state: "activated" }}), configurable: true }}); }} catch(e) {{}}
 
         sessionStorage.setItem("comprobante_navigation_source", "movements");
         sessionStorage.setItem("security_notice_dont_show_again", "true");
+
+        // 4. Esperar ion-router (igual que en el script del browser)
+        const ionRouter = await new Promise(resolve => {{
+            let n = 0;
+            const t = setInterval(() => {{
+                const r = document.querySelector("ion-router");
+                if (r || ++n > 50) {{ clearInterval(t); resolve(r); }}
+            }}, 100);
+        }});
+
+        // 5. Navegar
+        if (ionRouter) {{
+            await ionRouter.push(TARGET, "forward");
+        }} else {{
+            window.history.pushState({{}}, "", TARGET);
+            window.dispatchEvent(new PopStateEvent("popstate", {{ state: {{}} }}));
+        }}
+    }}
     """
 
     with sync_playwright() as p:
@@ -95,41 +120,28 @@ def capture(mvalue: str) -> bytes:
             user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
             device_scale_factor=3,
         )
-
-        # ── CLAVE: inyectar ANTES de que cargue cualquier JS ──────────────────
-        ctx.add_init_script(init_script)
-
         page = ctx.new_page()
 
-        # 1. Cargar app directamente en la ruta del comprobante
-        page.goto(f"{APP_URL}/comprobante/{mvalue}", wait_until="domcontentloaded", timeout=40000)
+        # 1. Cargar app en la raíz (igual que cuando abres el browser)
+        page.goto(APP_URL, wait_until="domcontentloaded", timeout=30000)
 
-        # 2. Esperar que ion-router esté listo y navegar si hace falta
+        # 2. Ejecutar inyección + navegación (exactamente como el inject_session.js)
+        page.evaluate(inject_and_navigate)
+
+        # 3. Esperar que aparezca el comprobante (igual que el script del browser)
         try:
-            page.wait_for_selector("ion-router", timeout=10000)
-            page.evaluate(f"""
-            async () => {{
-                const router = document.querySelector("ion-router");
-                const current = window.location.pathname;
-                if (router && !current.includes("{mvalue}")) {{
-                    sessionStorage.setItem("comprobante_navigation_source", "movements");
-                    await router.push("/comprobante/{mvalue}", "forward");
-                }}
-            }}
-            """)
+            page.wait_for_function("""
+                () => {
+                    return document.querySelector(".receipt-container") ||
+                           document.querySelector(".receipt-content")   ||
+                           document.querySelector(".labeled-value")     ||
+                           document.querySelector(".receipt-container__content-base");
+                }
+            """, timeout=30000)
         except:
             pass
 
-        # 3. Esperar que aparezca el contenido del comprobante
-        try:
-            page.wait_for_selector(
-                ".receipt-container__content-base, .labeled-value",
-                timeout=30000
-            )
-        except:
-            pass
-
-        # 4. Esperar que los datos estén renderizados (al menos 2 campos con texto)
+        # 4. Esperar que los datos estén cargados (no spinner)
         try:
             page.wait_for_function("""
                 () => {
@@ -137,20 +149,14 @@ def capture(mvalue: str) -> bytes:
                     return vals.length >= 2 &&
                            [...vals].filter(e => e.textContent.trim().length > 1).length >= 2;
                 }
-            """, timeout=25000)
+            """, timeout=20000)
         except:
             pass
 
-        # 5. Esperar que la red se calme
-        try:
-            page.wait_for_load_state("networkidle", timeout=15000)
-        except:
-            pass
+        # 5. Buffer final igual que en el script (1500ms)
+        page.wait_for_timeout(1500)
 
-        # 6. Buffer final para QR
-        page.wait_for_timeout(2000)
-
-        # 7. Ocultar UI
+        # 6. Ocultar topbar
         page.evaluate("""
         () => {
             [".bc-vouch-topbar", "ion-header", "[class*=topbar]",
@@ -160,7 +166,7 @@ def capture(mvalue: str) -> bytes:
         }
         """)
 
-        # 8. Capturar
+        # 7. Capturar el elemento del comprobante
         el = (
             page.query_selector(".receipt-wrapper") or
             page.query_selector(".receipt-container") or
