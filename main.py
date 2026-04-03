@@ -163,7 +163,7 @@ def capture(mvalue: str) -> bytes:
         print("[PW] Esperando .receipt-container...")
         try:
             page.wait_for_selector(
-                ".receipt-container, .receipt-content, .labeled-value, .receipt-container__content-base",
+                ".comprobante-container, .receipt-container, .receipt-content, .labeled-value, .receipt-container__content-base",
                 timeout=30000
             )
             print("[PW] receipt encontrado ✅")
@@ -195,7 +195,7 @@ def capture(mvalue: str) -> bytes:
         except Exception as e:
             print(f"[PW] datos timeout: {e}")
 
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(4000)
 
         # Log final
         final = page.evaluate("""
@@ -217,27 +217,28 @@ def capture(mvalue: str) -> bytes:
         }
         """)
 
+        # Selector correcto del comprobante
         el = (
-            page.query_selector(".receipt-wrapper") or
-            page.query_selector(".receipt-container") or
+            page.query_selector(".comprobante-container") or
+            page.query_selector(".receipt-wrapper")        or
             page.query_selector(".receipt-container__content-base")
         )
         print(f"[PW] Elemento captura: {'encontrado' if el else 'body fallback'}")
 
         if el:
-            # Obtener altura real del elemento
+            # Medir altura real del contenido
             el_height = page.evaluate("""
                 () => {
-                    const el = document.querySelector(".receipt-wrapper") ||
-                               document.querySelector(".receipt-container") ||
+                    const el = document.querySelector(".comprobante-container") ||
+                               document.querySelector(".receipt-wrapper") ||
                                document.querySelector(".receipt-container__content-base");
                     return el ? el.scrollHeight : document.body.scrollHeight;
                 }
             """)
             print(f"[PW] Altura elemento: {el_height}px")
-            # Expandir viewport para que no recorte
-            page.set_viewport_size({"width": 430, "height": max(el_height + 200, 932)})
-            page.wait_for_timeout(300)
+            # Expandir viewport a la altura completa del comprobante
+            page.set_viewport_size({"width": 430, "height": max(el_height + 100, 932)})
+            page.wait_for_timeout(500)
             png = el.screenshot(type="png")
         else:
             png = page.screenshot(type="png", full_page=True)
