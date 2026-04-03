@@ -207,41 +207,53 @@ def capture(mvalue: str) -> bytes:
         """)
         print(f"[DOM FINAL] {json.dumps(final, ensure_ascii=False)}")
 
-        # ── PASO 6: Capturar ──────────────────────────────────────────────────
+        # ── PASO 6: Preparar y capturar ───────────────────────────────────────
         page.evaluate("""
         () => {
-            [".bc-vouch-topbar","ion-header","[class*=topbar]",
-             ".button-listo",".button-container","ion-spinner"].forEach(sel => {
+            // Ocultar topbar y botones de UI
+            [".comprobante-topbar", ".bc-vouch-topbar", "ion-header",
+             "[class*=topbar]", ".button-listo", ".button-container",
+             ".problem-text", "ion-spinner"].forEach(sel => {
                 document.querySelectorAll(sel).forEach(el => el.style.display = "none");
             });
+
+            // Quitar fondo oscuro del ion-content y poner el correcto
+            const ionContent = document.querySelector("ion-content");
+            if (ionContent) {
+                ionContent.style.setProperty("--background", "#FCF7FB");
+            }
+
+            // Asegurar que el comprobante-container sea visible completo
+            const container = document.querySelector(".comprobante-container");
+            if (container) {
+                container.style.overflow = "visible";
+            }
         }
         """)
 
-        # Selector correcto del comprobante
+        # Medir altura real del receipt-wrapper completo
+        el_height = page.evaluate("""
+            () => {
+                const el = document.querySelector(".receipt-wrapper") ||
+                           document.querySelector(".comprobante-container") ||
+                           document.querySelector(".receipt-container__content-base");
+                return el ? el.scrollHeight : document.body.scrollHeight;
+            }
+        """)
+        print(f"[PW] Altura receipt: {el_height}px")
+
+        # Expandir viewport para captura completa sin recortes
+        page.set_viewport_size({"width": 430, "height": max(el_height + 60, 932)})
+        page.wait_for_timeout(400)
+
+        # Capturar el receipt-wrapper (sin topbar, solo el comprobante)
         el = (
+            page.query_selector(".receipt-wrapper") or
             page.query_selector(".comprobante-container") or
-            page.query_selector(".receipt-wrapper")        or
             page.query_selector(".receipt-container__content-base")
         )
         print(f"[PW] Elemento captura: {'encontrado' if el else 'body fallback'}")
-
-        if el:
-            # Medir altura real del contenido
-            el_height = page.evaluate("""
-                () => {
-                    const el = document.querySelector(".comprobante-container") ||
-                               document.querySelector(".receipt-wrapper") ||
-                               document.querySelector(".receipt-container__content-base");
-                    return el ? el.scrollHeight : document.body.scrollHeight;
-                }
-            """)
-            print(f"[PW] Altura elemento: {el_height}px")
-            # Expandir viewport a la altura completa del comprobante
-            page.set_viewport_size({"width": 430, "height": max(el_height + 100, 932)})
-            page.wait_for_timeout(500)
-            png = el.screenshot(type="png")
-        else:
-            png = page.screenshot(type="png", full_page=True)
+        png = el.screenshot(type="png") if el else page.screenshot(type="png", full_page=True)
 
         print(f"[PW] PNG: {len(png)} bytes")
 
