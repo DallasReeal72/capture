@@ -45,39 +45,44 @@ def capture(mvalue: str) -> bytes:
         "appName": "[DEFAULT]",
     }
 
-    inject_js = f"""
-    () => {{
+    # Este script se ejecuta ANTES de que cualquier JS de la página corra
+    init_script = f"""
+        // Inyectar sesión Firebase antes de que React monte
         const AUTH_KEY  = {json.dumps(auth_key)};
         const authUser  = {json.dumps(auth_user)};
         const DEVICE_ID = {json.dumps(DEVICE_ID)};
 
-        localStorage.setItem(AUTH_KEY, JSON.stringify(authUser));
-        localStorage.setItem("device_id", DEVICE_ID);
+        // localStorage
+        try {{
+            localStorage.setItem(AUTH_KEY, JSON.stringify(authUser));
+            localStorage.setItem("device_id", DEVICE_ID);
+            localStorage.setItem("accountType", "deposit");
+        }} catch(e) {{}}
 
-        const req = indexedDB.open("firebaseLocalStorageDb", 1);
-        req.onupgradeneeded = (e) => {{
-            if (!e.target.result.objectStoreNames.contains("firebaseLocalStorage"))
-                e.target.result.createObjectStore("firebaseLocalStorage", {{ keyPath: "fbase_key" }});
-        }};
-        req.onsuccess = (e) => {{
-            const db = e.target.result;
-            if (!db.objectStoreNames.contains("firebaseLocalStorage")) return;
-            const tx = db.transaction("firebaseLocalStorage", "readwrite");
-            tx.objectStore("firebaseLocalStorage").put({{ fbase_key: AUTH_KEY, value: authUser }});
-        }};
-
-        const orig = window.matchMedia.bind(window);
+        // PWA spoof — antes de que React lea matchMedia
+        const _origMM = window.matchMedia ? window.matchMedia.bind(window) : () => ({{}});
         window.matchMedia = (q) => {{
-            if (q.includes("display-mode")) return {{
+            if (q && q.includes("display-mode")) return {{
                 matches: q.includes("standalone"), media: q, onchange: null,
                 addEventListener: () => {{}}, removeEventListener: () => {{}}, dispatchEvent: () => false,
             }};
-            return orig(q);
+            return _origMM(q);
         }};
+
         try {{ Object.defineProperty(navigator, "standalone", {{ get: () => true, configurable: true }}); }} catch(e) {{}}
-        try {{ Object.defineProperty(navigator.serviceWorker, "controller", {{ get: () => ({{ state: "activated" }}), configurable: true }}); }} catch(e) {{}}
+
+        Object.defineProperty(navigator, "serviceWorker", {{
+            get: () => ({{
+                controller: {{ state: "activated" }},
+                ready: Promise.resolve({{ active: {{ state: "activated" }} }}),
+                addEventListener: () => {{}},
+                register: () => Promise.resolve({{}}),
+            }}),
+            configurable: true,
+        }});
+
         sessionStorage.setItem("comprobante_navigation_source", "movements");
-    }}
+        sessionStorage.setItem("security_notice_dont_show_again", "true");
     """
 
     with sync_playwright() as p:
@@ -90,37 +95,41 @@ def capture(mvalue: str) -> bytes:
             user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
             device_scale_factor=3,
         )
+
+        # ── CLAVE: inyectar ANTES de que cargue cualquier JS ──────────────────
+        ctx.add_init_script(init_script)
+
         page = ctx.new_page()
 
-        # 1. Cargar app completa
-        page.goto(APP_URL, wait_until="networkidle", timeout=40000)
-        page.wait_for_timeout(2000)
+        # 1. Cargar app directamente en la ruta del comprobante
+        page.goto(f"{APP_URL}/comprobante/{mvalue}", wait_until="domcontentloaded", timeout=40000)
 
-        # 2. Inyectar sesión
-        page.evaluate(inject_js)
-        page.wait_for_timeout(2000)
-
-        # 3. Navegar al comprobante
-        page.evaluate(f"""
-        async () => {{
-            const ionRouter = document.querySelector("ion-router");
-            sessionStorage.setItem("comprobante_navigation_source", "movements");
-            if (ionRouter) {{
-                await ionRouter.push("/comprobante/{mvalue}", "forward");
-            }} else {{
-                window.history.pushState({{}}, "", "/comprobante/{mvalue}");
-                window.dispatchEvent(new PopStateEvent("popstate", {{ state: {{}} }}));
-            }}
-        }}
-        """)
-
-        # 4. Esperar que la red se calme (API calls completadas)
+        # 2. Esperar que ion-router esté listo y navegar si hace falta
         try:
-            page.wait_for_load_state("networkidle", timeout=20000)
+            page.wait_for_selector("ion-router", timeout=10000)
+            page.evaluate(f"""
+            async () => {{
+                const router = document.querySelector("ion-router");
+                const current = window.location.pathname;
+                if (router && !current.includes("{mvalue}")) {{
+                    sessionStorage.setItem("comprobante_navigation_source", "movements");
+                    await router.push("/comprobante/{mvalue}", "forward");
+                }}
+            }}
+            """)
         except:
             pass
 
-        # 5. Esperar que .labeled-value__value tenga texto real (datos del comprobante)
+        # 3. Esperar que aparezca el contenido del comprobante
+        try:
+            page.wait_for_selector(
+                ".receipt-container__content-base, .labeled-value",
+                timeout=30000
+            )
+        except:
+            pass
+
+        # 4. Esperar que los datos estén renderizados (al menos 2 campos con texto)
         try:
             page.wait_for_function("""
                 () => {
@@ -132,24 +141,16 @@ def capture(mvalue: str) -> bytes:
         except:
             pass
 
-        # 6. Esperar que no haya spinners visibles
+        # 5. Esperar que la red se calme
         try:
-            page.wait_for_function("""
-                () => {
-                    const spinners = document.querySelectorAll("ion-spinner, [class*=spinner]");
-                    return [...spinners].every(el => {
-                        const style = window.getComputedStyle(el);
-                        return style.display === "none" || style.visibility === "hidden" || style.opacity === "0";
-                    });
-                }
-            """, timeout=10000)
+            page.wait_for_load_state("networkidle", timeout=15000)
         except:
             pass
 
-        # 7. Buffer final
-        page.wait_for_timeout(3000)
+        # 6. Buffer final para QR
+        page.wait_for_timeout(2000)
 
-        # 8. Ocultar UI elements
+        # 7. Ocultar UI
         page.evaluate("""
         () => {
             [".bc-vouch-topbar", "ion-header", "[class*=topbar]",
@@ -159,7 +160,7 @@ def capture(mvalue: str) -> bytes:
         }
         """)
 
-        # 9. Capturar
+        # 8. Capturar
         el = (
             page.query_selector(".receipt-wrapper") or
             page.query_selector(".receipt-container") or
@@ -167,7 +168,6 @@ def capture(mvalue: str) -> bytes:
         )
 
         png = el.screenshot(type="png") if el else page.screenshot(type="png", full_page=True)
-
         browser.close()
         return png
 
