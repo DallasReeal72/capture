@@ -11,7 +11,6 @@ PASSWORD  = os.getenv("FIREBASE_PASS",    "0000##")
 DEVICE_ID = os.getenv("DEVICE_ID",        "n9N1cd2jsF3xGfsVNf9x")
 APP_URL   = "https://xn--eky-6ma.com"
 
-# Token cache
 _cache = {"token": None, "refresh": None, "exp": 0}
 
 def get_session():
@@ -71,7 +70,7 @@ def capture(mvalue: str) -> bytes:
             headless=True,
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
         )
-        ctx  = browser.new_context(
+        ctx = browser.new_context(
             viewport={"width": 430, "height": 932},
             user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
             device_scale_factor=3,
@@ -84,7 +83,7 @@ def capture(mvalue: str) -> bytes:
         # 2. Inyectar sesión + spoofs
         page.evaluate(inject_js)
 
-        # 3. Navegar al comprobante via ion-router
+        # 3. Navegar al comprobante
         page.evaluate(f"""
         async () => {{
             const router = document.querySelector("ion-router");
@@ -97,23 +96,55 @@ def capture(mvalue: str) -> bytes:
         }}
         """)
 
-        # 4. Esperar que cargue el comprobante
+        # 4. Esperar que aparezca el receipt
         try:
-            page.wait_for_selector(".receipt-container, .receipt-content, .labeled-value", timeout=15000)
+            page.wait_for_selector(
+                ".receipt-container, .receipt-content, .labeled-value, .receipt-container__content-base",
+                timeout=20000
+            )
         except:
             pass
-        page.wait_for_timeout(2000)
 
-        # 5. Ocultar topbar
+        # 5. Esperar que el spinner desaparezca
+        try:
+            page.wait_for_selector(
+                "ion-spinner, [class*=spinner], [class*=loading]",
+                state="hidden",
+                timeout=10000
+            )
+        except:
+            pass
+
+        # 6. Esperar que los datos reales estén renderizados
+        try:
+            page.wait_for_function("""
+                () => {
+                    const el = document.querySelector(".labeled-value__value");
+                    return el && el.textContent.trim().length > 0;
+                }
+            """, timeout=15000)
+        except:
+            pass
+
+        # 7. Buffer extra para QR e imágenes
+        page.wait_for_timeout(3000)
+
+        # 8. Ocultar topbar y botones de UI
         page.evaluate("""
         () => {
-            [".bc-vouch-topbar","ion-header","[class*=topbar]"].forEach(sel => {
+            [
+                ".bc-vouch-topbar",
+                "ion-header",
+                "[class*=topbar]",
+                ".button-listo",
+                ".button-container"
+            ].forEach(sel => {
                 document.querySelectorAll(sel).forEach(el => el.style.display = "none");
             });
         }
         """)
 
-        # 6. Capturar el elemento del comprobante
+        # 9. Capturar solo el elemento del comprobante
         el = (
             page.query_selector(".receipt-wrapper") or
             page.query_selector(".receipt-container") or
