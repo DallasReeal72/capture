@@ -223,7 +223,25 @@ def capture(mvalue: str) -> bytes:
             page.query_selector(".receipt-container__content-base")
         )
         print(f"[PW] Elemento captura: {'encontrado' if el else 'body fallback'}")
-        png = el.screenshot(type="png") if el else page.screenshot(type="png", full_page=True)
+
+        if el:
+            # Obtener altura real del elemento
+            el_height = page.evaluate("""
+                () => {
+                    const el = document.querySelector(".receipt-wrapper") ||
+                               document.querySelector(".receipt-container") ||
+                               document.querySelector(".receipt-container__content-base");
+                    return el ? el.scrollHeight : document.body.scrollHeight;
+                }
+            """)
+            print(f"[PW] Altura elemento: {el_height}px")
+            # Expandir viewport para que no recorte
+            page.set_viewport_size({"width": 430, "height": max(el_height + 200, 932)})
+            page.wait_for_timeout(300)
+            png = el.screenshot(type="png")
+        else:
+            png = page.screenshot(type="png", full_page=True)
+
         print(f"[PW] PNG: {len(png)} bytes")
 
         browser.close()
