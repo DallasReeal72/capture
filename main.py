@@ -46,81 +46,6 @@ def capture(mvalue: str) -> bytes:
         "appName": "[DEFAULT]",
     }
 
-    inject_and_navigate = f"""
-    async () => {{
-        const AUTH_KEY  = {json.dumps(auth_key)};
-        const authUser  = {json.dumps(auth_user)};
-        const DEVICE_ID = {json.dumps(DEVICE_ID)};
-        const TARGET    = "/comprobante/{mvalue}";
-
-        console.log("[PW] Inyectando sesión...");
-
-        localStorage.setItem(AUTH_KEY, JSON.stringify(authUser));
-        localStorage.setItem("device_id", DEVICE_ID);
-        localStorage.setItem("accountType", "deposit");
-        localStorage.setItem("security_notice_dont_show_again", "true");
-
-        console.log("[PW] localStorage OK — key:", AUTH_KEY.substring(0, 30));
-
-        await new Promise((resolve) => {{
-            const req = indexedDB.open("firebaseLocalStorageDb", 1);
-            req.onupgradeneeded = e => {{
-                if (!e.target.result.objectStoreNames.contains("firebaseLocalStorage"))
-                    e.target.result.createObjectStore("firebaseLocalStorage", {{ keyPath: "fbase_key" }});
-            }};
-            req.onsuccess = e => {{
-                const db = e.target.result;
-                if (!db.objectStoreNames.contains("firebaseLocalStorage")) return resolve();
-                const tx = db.transaction("firebaseLocalStorage", "readwrite");
-                tx.objectStore("firebaseLocalStorage").put({{ fbase_key: AUTH_KEY, value: authUser }});
-                tx.oncomplete = () => {{ console.log("[PW] IndexedDB OK"); resolve(); }};
-                tx.onerror = resolve;
-            }};
-            req.onerror = () => {{ console.log("[PW] IndexedDB ERROR"); resolve(); }};
-        }});
-
-        // PWA spoof
-        const _orig = window.matchMedia.bind(window);
-        window.matchMedia = (q) => {{
-            if (q && q.includes("display-mode")) return {{
-                matches: q.includes("standalone"), media: q, onchange: null,
-                addEventListener: () => {{}}, removeEventListener: () => {{}}, dispatchEvent: () => false,
-            }};
-            return _orig(q);
-        }};
-        try {{ Object.defineProperty(navigator, "standalone", {{ get: () => true, configurable: true }}); }} catch(e) {{}}
-        try {{ Object.defineProperty(navigator.serviceWorker, "controller", {{ get: () => ({{ state: "activated" }}), configurable: true }}); }} catch(e) {{}}
-
-        sessionStorage.setItem("comprobante_navigation_source", "movements");
-        sessionStorage.setItem("security_notice_dont_show_again", "true");
-
-        console.log("[PW] PWA spoofed");
-        console.log("[PW] URL actual:", window.location.pathname);
-
-        // Esperar ion-router
-        const ionRouter = await new Promise(resolve => {{
-            let n = 0;
-            const t = setInterval(() => {{
-                const r = document.querySelector("ion-router");
-                if (r || ++n > 50) {{ clearInterval(t); resolve(r); }}
-            }}, 100);
-        }});
-
-        console.log("[PW] ion-router:", ionRouter ? "encontrado" : "NO encontrado");
-
-        if (ionRouter) {{
-            await ionRouter.push(TARGET, "forward");
-            console.log("[PW] Navegado via ion-router a", TARGET);
-        }} else {{
-            window.history.pushState({{}}, "", TARGET);
-            window.dispatchEvent(new PopStateEvent("popstate", {{ state: {{}} }}));
-            console.log("[PW] Navegado via history API a", TARGET);
-        }}
-
-        console.log("[PW] URL después de navegar:", window.location.pathname);
-    }}
-    """
-
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -132,77 +57,157 @@ def capture(mvalue: str) -> bytes:
             device_scale_factor=3,
         )
         page = ctx.new_page()
+        page.on("console", lambda msg: print(f"[JS] {msg.text}"))
+        page.on("pageerror", lambda err: print(f"[JS ERROR] {err}"))
 
-        # Capturar logs del browser en Python
-        page.on("console", lambda msg: print(f"[BROWSER] {msg.type}: {msg.text}"))
-        page.on("pageerror", lambda err: print(f"[BROWSER ERROR] {err}"))
-
+        # ── PASO 1: Cargar app y esperar que React monte completamente ─────────
         print(f"[PW] Cargando {APP_URL}...")
         page.goto(APP_URL, wait_until="domcontentloaded", timeout=30000)
-        print(f"[PW] App cargada — URL: {page.url}")
 
-        print("[PW] Ejecutando inyección + navegación...")
-        page.evaluate(inject_and_navigate)
-        print(f"[PW] Post-inyección — URL: {page.url}")
-
-        print("[PW] Esperando comprobante...")
+        # Esperar que ion-app esté en el DOM (React montó)
+        print("[PW] Esperando que React monte...")
         try:
-            page.wait_for_function("""
-                () => {
-                    const ok = document.querySelector(".receipt-container") ||
-                               document.querySelector(".receipt-content")   ||
-                               document.querySelector(".labeled-value")     ||
-                               document.querySelector(".receipt-container__content-base");
-                    if (ok) console.log("[PW] receipt encontrado:", ok.className);
-                    return ok;
-                }
-            """, timeout=30000)
-            print("[PW] receipt detectado ✅")
-        except Exception as e:
-            print(f"[PW] Timeout esperando receipt: {e}")
+            page.wait_for_selector("ion-app", timeout=15000)
+            print("[PW] ion-app detectado ✅")
+        except:
+            print("[PW] ion-app timeout")
 
-        # Log del DOM actual para debug
-        dom_info = page.evaluate("""
-            () => ({
-                url:      window.location.pathname,
-                title:    document.title,
-                receipt:  !!document.querySelector(".receipt-container"),
-                labeled:  document.querySelectorAll(".labeled-value__value").length,
-                spinner:  !!document.querySelector("ion-spinner"),
-                ionPage:  document.querySelectorAll("ion-page").length,
-                body100:  document.body.innerHTML.substring(0, 100),
-            })
+        # Esperar ion-router también
+        try:
+            page.wait_for_selector("ion-router", timeout=10000)
+            print("[PW] ion-router detectado ✅")
+        except:
+            print("[PW] ion-router timeout")
+
+        print(f"[PW] URL actual: {page.url}")
+        print(f"[PW] Pathname: {page.evaluate('() => window.location.pathname')}")
+
+        # ── PASO 2: Inyectar sesión (igual que inject_session.js) ─────────────
+        print("[PW] Inyectando sesión...")
+        page.evaluate(f"""
+        async () => {{
+            const AUTH_KEY  = {json.dumps(auth_key)};
+            const authUser  = {json.dumps(auth_user)};
+            const DEVICE_ID = {json.dumps(DEVICE_ID)};
+
+            localStorage.setItem(AUTH_KEY, JSON.stringify(authUser));
+            localStorage.setItem("device_id", DEVICE_ID);
+            localStorage.setItem("accountType", "deposit");
+            localStorage.setItem("security_notice_dont_show_again", "true");
+            console.log("[PW] localStorage OK");
+
+            await new Promise((resolve) => {{
+                const req = indexedDB.open("firebaseLocalStorageDb", 1);
+                req.onupgradeneeded = e => {{
+                    if (!e.target.result.objectStoreNames.contains("firebaseLocalStorage"))
+                        e.target.result.createObjectStore("firebaseLocalStorage", {{ keyPath: "fbase_key" }});
+                }};
+                req.onsuccess = e => {{
+                    const db = e.target.result;
+                    if (!db.objectStoreNames.contains("firebaseLocalStorage")) return resolve();
+                    const tx = db.transaction("firebaseLocalStorage", "readwrite");
+                    tx.objectStore("firebaseLocalStorage").put({{ fbase_key: AUTH_KEY, value: authUser }});
+                    tx.oncomplete = () => {{ console.log("[PW] IndexedDB OK"); resolve(); }};
+                    tx.onerror = resolve;
+                }};
+                req.onerror = resolve;
+            }});
+
+            const _orig = window.matchMedia.bind(window);
+            window.matchMedia = (q) => {{
+                if (q && q.includes("display-mode")) return {{
+                    matches: q.includes("standalone"), media: q, onchange: null,
+                    addEventListener: () => {{}}, removeEventListener: () => {{}}, dispatchEvent: () => false,
+                }};
+                return _orig(q);
+            }};
+            try {{ Object.defineProperty(navigator, "standalone", {{ get: () => true, configurable: true }}); }} catch(e) {{}}
+            try {{ Object.defineProperty(navigator.serviceWorker, "controller", {{ get: () => ({{ state: "activated" }}), configurable: true }}); }} catch(e) {{}}
+
+            sessionStorage.setItem("comprobante_navigation_source", "movements");
+            sessionStorage.setItem("security_notice_dont_show_again", "true");
+            console.log("[PW] Sesión + PWA spoof OK");
+        }}
         """)
-        print(f"[DOM] {json.dumps(dom_info, ensure_ascii=False)}")
+
+        # ── PASO 3: Esperar que ion-router procese la sesión y navegue ─────────
+        # En el browser tú ya tienes la app montada, aquí necesitamos
+        # que Firebase Auth procese el localStorage — damos tiempo
+        print("[PW] Esperando que Firebase Auth procese la sesión...")
+        page.wait_for_timeout(3000)
+
+        # ── PASO 4: Navegar via ion-router ────────────────────────────────────
+        print(f"[PW] Navegando a /comprobante/{mvalue}...")
+        nav_result = page.evaluate(f"""
+        async () => {{
+            const ionRouter = document.querySelector("ion-router");
+            console.log("[PW] ion-router al navegar:", ionRouter ? "OK" : "null");
+            sessionStorage.setItem("comprobante_navigation_source", "movements");
+
+            if (ionRouter) {{
+                await ionRouter.push("/comprobante/{mvalue}", "forward");
+                console.log("[PW] push ejecutado");
+                return "ion-router";
+            }} else {{
+                window.history.pushState({{}}, "", "/comprobante/{mvalue}");
+                window.dispatchEvent(new PopStateEvent("popstate", {{ state: {{}} }}));
+                console.log("[PW] history API usado");
+                return "history";
+            }}
+        }}
+        """)
+        print(f"[PW] Navegación via: {nav_result}")
+        print(f"[PW] URL post-nav: {page.evaluate('() => window.location.pathname')}")
+
+        # ── PASO 5: Esperar comprobante ────────────────────────────────────────
+        print("[PW] Esperando .receipt-container...")
+        try:
+            page.wait_for_selector(
+                ".receipt-container, .receipt-content, .labeled-value, .receipt-container__content-base",
+                timeout=30000
+            )
+            print("[PW] receipt encontrado ✅")
+        except Exception as e:
+            print(f"[PW] receipt timeout: {e}")
+
+        # Log DOM intermedio
+        dom = page.evaluate("""
+        () => ({
+            path:    window.location.pathname,
+            receipt: !!document.querySelector(".receipt-container"),
+            labels:  document.querySelectorAll(".labeled-value__value").length,
+            spinner: !!document.querySelector("ion-spinner"),
+            pages:   document.querySelectorAll("ion-page").length,
+        })
+        """)
+        print(f"[DOM] {json.dumps(dom)}")
 
         # Esperar datos reales
         try:
             page.wait_for_function("""
                 () => {
                     const vals = document.querySelectorAll(".labeled-value__value");
-                    const loaded = vals.length >= 2 &&
-                                   [...vals].filter(e => e.textContent.trim().length > 1).length >= 2;
-                    if (loaded) console.log("[PW] datos cargados ✅ — campos:", vals.length);
-                    return loaded;
+                    return vals.length >= 2 &&
+                           [...vals].filter(e => e.textContent.trim().length > 1).length >= 2;
                 }
             """, timeout=20000)
             print("[PW] Datos del comprobante listos ✅")
         except Exception as e:
-            print(f"[PW] Timeout esperando datos: {e}")
+            print(f"[PW] datos timeout: {e}")
 
         page.wait_for_timeout(1500)
 
         # Log final
-        final_info = page.evaluate("""
-            () => ({
-                url:     window.location.pathname,
-                receipt: !!document.querySelector(".receipt-container"),
-                labeled: [...document.querySelectorAll(".labeled-value__value")].map(e => e.textContent.trim()).slice(0,4),
-            })
+        final = page.evaluate("""
+        () => ({
+            path:   window.location.pathname,
+            fields: [...document.querySelectorAll(".labeled-value__value")]
+                        .map(e => e.textContent.trim()).slice(0, 5),
+        })
         """)
-        print(f"[DOM FINAL] {json.dumps(final_info, ensure_ascii=False)}")
+        print(f"[DOM FINAL] {json.dumps(final, ensure_ascii=False)}")
 
-        # Ocultar UI
+        # ── PASO 6: Capturar ──────────────────────────────────────────────────
         page.evaluate("""
         () => {
             [".bc-vouch-topbar","ion-header","[class*=topbar]",
@@ -217,15 +222,12 @@ def capture(mvalue: str) -> bytes:
             page.query_selector(".receipt-container") or
             page.query_selector(".receipt-container__content-base")
         )
-
-        print(f"[PW] Elemento a capturar: {el is not None}")
+        print(f"[PW] Elemento captura: {'encontrado' if el else 'body fallback'}")
         png = el.screenshot(type="png") if el else page.screenshot(type="png", full_page=True)
-        print(f"[PW] PNG generado: {len(png)} bytes")
+        print(f"[PW] PNG: {len(png)} bytes")
 
         browser.close()
         return png
-
-# ─── Rutas ────────────────────────────────────────────────────────────────────
 
 @app.route("/health")
 def health():
@@ -233,11 +235,10 @@ def health():
 
 @app.route("/captura/<mvalue>", methods=["GET"])
 def captura_get(mvalue):
-    print(f"\n[REQ] GET /captura/{mvalue}")
+    print(f"\n{'='*50}\n[REQ] GET /captura/{mvalue}\n{'='*50}")
     try:
         png = capture(mvalue)
-        return send_file(io.BytesIO(png), mimetype="image/png",
-                         download_name=f"{mvalue}.png")
+        return send_file(io.BytesIO(png), mimetype="image/png", download_name=f"{mvalue}.png")
     except Exception as e:
         print(f"[ERROR] {e}")
         return jsonify({"error": str(e)}), 500
@@ -246,13 +247,12 @@ def captura_get(mvalue):
 def captura_post():
     data   = request.json or {}
     mvalue = data.get("mvalue")
-    print(f"\n[REQ] POST /captura — mvalue: {mvalue}")
+    print(f"\n{'='*50}\n[REQ] POST /captura — {mvalue}\n{'='*50}")
     if not mvalue:
         return jsonify({"error": "mvalue requerido"}), 400
     try:
         png = capture(mvalue)
-        return send_file(io.BytesIO(png), mimetype="image/png",
-                         download_name=f"{mvalue}.png")
+        return send_file(io.BytesIO(png), mimetype="image/png", download_name=f"{mvalue}.png")
     except Exception as e:
         print(f"[ERROR] {e}")
         return jsonify({"error": str(e)}), 500
