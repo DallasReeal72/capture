@@ -4,7 +4,6 @@ import io, os, time, requests, json
 
 app = Flask(__name__)
 
-# ─── Config ───────────────────────────────────────────────────────────────────
 API_KEY   = os.getenv("FIREBASE_API_KEY", "AIzaSyDBefDvlrg1n7haTuoiQqekKoV139BmK5c")
 EMAIL     = os.getenv("FIREBASE_EMAIL",   "3998880000@gmail.com")
 PASSWORD  = os.getenv("FIREBASE_PASS",    "0000##")
@@ -35,9 +34,15 @@ def capture(mvalue: str) -> bytes:
     auth_user = {
         "uid": sess["uid"], "email": EMAIL, "emailVerified": False, "isAnonymous": False,
         "providerData": [{"providerId": "password", "uid": EMAIL, "email": EMAIL, "displayName": None, "photoURL": None}],
-        "stsTokenManager": {"refreshToken": sess["refresh"], "accessToken": sess["token"], "expirationTime": int(time.time()*1000) + 3600000},
-        "createdAt": str(int(time.time()*1000)), "lastLoginAt": str(int(time.time()*1000)),
-        "apiKey": API_KEY, "appName": "[DEFAULT]",
+        "stsTokenManager": {
+            "refreshToken":   sess["refresh"],
+            "accessToken":    sess["token"],
+            "expirationTime": int(time.time()*1000) + 3600000
+        },
+        "createdAt":   str(int(time.time()*1000)),
+        "lastLoginAt": str(int(time.time()*1000)),
+        "apiKey":   API_KEY,
+        "appName":  "[DEFAULT]",
     }
 
     inject_js = f"""
@@ -49,6 +54,21 @@ def capture(mvalue: str) -> bytes:
         localStorage.setItem(AUTH_KEY, JSON.stringify(authUser));
         localStorage.setItem("device_id", DEVICE_ID);
 
+        // IndexedDB también
+        const req = indexedDB.open("firebaseLocalStorageDb", 1);
+        req.onupgradeneeded = (e) => {{
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains("firebaseLocalStorage"))
+                db.createObjectStore("firebaseLocalStorage", {{ keyPath: "fbase_key" }});
+        }};
+        req.onsuccess = (e) => {{
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains("firebaseLocalStorage")) return;
+            const tx = db.transaction("firebaseLocalStorage", "readwrite");
+            tx.objectStore("firebaseLocalStorage").put({{ fbase_key: AUTH_KEY, value: authUser }});
+        }};
+
+        // PWA spoof
         const orig = window.matchMedia.bind(window);
         window.matchMedia = (q) => {{
             if (q.includes("display-mode")) return {{
@@ -57,10 +77,8 @@ def capture(mvalue: str) -> bytes:
             }};
             return orig(q);
         }};
-
         try {{ Object.defineProperty(navigator, "standalone", {{ get: () => true, configurable: true }}); }} catch(e) {{}}
         try {{ Object.defineProperty(navigator.serviceWorker, "controller", {{ get: () => ({{ state: "activated" }}), configurable: true }}); }} catch(e) {{}}
-
         sessionStorage.setItem("comprobante_navigation_source", "movements");
     }}
     """
@@ -77,18 +95,34 @@ def capture(mvalue: str) -> bytes:
         )
         page = ctx.new_page()
 
-        # 1. Cargar app
-        page.goto(APP_URL, wait_until="domcontentloaded", timeout=30000)
+        # 1. Cargar app y dejar que inicialice
+        page.goto(APP_URL, wait_until="networkidle", timeout=30000)
 
-        # 2. Inyectar sesión + spoofs
+        # 2. Inyectar sesión
         page.evaluate(inject_js)
 
-        # 3. Navegar al comprobante
+        # 3. Esperar que Firebase Auth procese la sesión del localStorage
+        page.wait_for_timeout(3000)
+
+        # 4. Verificar que la sesión fue procesada antes de navegar
+        try:
+            page.wait_for_function(f"""
+                () => {{
+                    const key = {json.dumps(auth_key)};
+                    const val = localStorage.getItem(key);
+                    return val !== null;
+                }}
+            """, timeout=5000)
+        except:
+            pass
+
+        # 5. Navegar al comprobante
         page.evaluate(f"""
         async () => {{
-            const router = document.querySelector("ion-router");
-            if (router) {{
-                await router.push("/comprobante/{mvalue}", "forward");
+            const ionRouter = document.querySelector("ion-router");
+            if (ionRouter) {{
+                sessionStorage.setItem("comprobante_navigation_source", "movements");
+                await ionRouter.push("/comprobante/{mvalue}", "forward");
             }} else {{
                 window.history.pushState({{}}, "", "/comprobante/{mvalue}");
                 window.dispatchEvent(new PopStateEvent("popstate", {{ state: {{}} }}));
@@ -96,65 +130,47 @@ def capture(mvalue: str) -> bytes:
         }}
         """)
 
-        # 4. Esperar que aparezca el receipt
+        # 6. Esperar que aparezca el receipt (con datos reales, no el spinner)
         try:
             page.wait_for_selector(
-                ".receipt-container, .receipt-content, .labeled-value, .receipt-container__content-base",
-                timeout=20000
+                ".receipt-container__content-base, .labeled-value",
+                timeout=25000
             )
         except:
             pass
 
-        # 5. Esperar que el spinner desaparezca
-        try:
-            page.wait_for_selector(
-                "ion-spinner, [class*=spinner], [class*=loading]",
-                state="hidden",
-                timeout=10000
-            )
-        except:
-            pass
-
-        # 6. Esperar que los datos reales estén renderizados
+        # 7. Esperar que .labeled-value__value tenga contenido real
         try:
             page.wait_for_function("""
                 () => {
-                    const el = document.querySelector(".labeled-value__value");
-                    return el && el.textContent.trim().length > 0;
+                    const els = document.querySelectorAll(".labeled-value__value");
+                    return els.length > 0 && [...els].some(e => e.textContent.trim().length > 1);
                 }
-            """, timeout=15000)
+            """, timeout=20000)
         except:
             pass
 
-        # 7. Buffer extra para QR e imágenes
-        page.wait_for_timeout(3000)
+        # 8. Buffer final para QR e imágenes
+        page.wait_for_timeout(2500)
 
-        # 8. Ocultar topbar y botones de UI
+        # 9. Ocultar elementos de UI
         page.evaluate("""
         () => {
-            [
-                ".bc-vouch-topbar",
-                "ion-header",
-                "[class*=topbar]",
-                ".button-listo",
-                ".button-container"
-            ].forEach(sel => {
+            [".bc-vouch-topbar", "ion-header", "[class*=topbar]",
+             ".button-listo", ".button-container", "ion-spinner"].forEach(sel => {
                 document.querySelectorAll(sel).forEach(el => el.style.display = "none");
             });
         }
         """)
 
-        # 9. Capturar solo el elemento del comprobante
+        # 10. Capturar
         el = (
             page.query_selector(".receipt-wrapper") or
             page.query_selector(".receipt-container") or
             page.query_selector(".receipt-container__content-base")
         )
 
-        if el:
-            png = el.screenshot(type="png")
-        else:
-            png = page.screenshot(type="png", full_page=True)
+        png = el.screenshot(type="png") if el else page.screenshot(type="png", full_page=True)
 
         browser.close()
         return png
@@ -188,5 +204,5 @@ def captura_post():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 3000))
+    port = int(os.getenv("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
